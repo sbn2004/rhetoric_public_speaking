@@ -1,6 +1,7 @@
 import cv2
 import os
 import numpy as np
+from faster_whisper import WhisperModel
 from moviepy import VideoFileClip
 import speech_recognition as sr
 import random
