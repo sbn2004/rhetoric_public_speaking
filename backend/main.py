@@ -1,92 +1,129 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-import uvicorn
+from faster_whisper import WhisperModel
+import subprocess
+import librosa
 import os
-import shutil
-from analyzer import (
-    analyze_video_gestures,
-    analyze_audio_quality,
-    get_motivational_quote
-)
 
-app = FastAPI()
+# -------------------- APP INIT --------------------
+app = FastAPI(title="Rhetoric Public Speaking Analyzer")
 
-# ---------------------------------
-# CORS CONFIGURATION (VERCEL + LOCAL)
-# ---------------------------------
+# Enable CORS for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://rhetoric-public-speaking.vercel.app",  # Vercel frontend
-        "http://localhost:5173",                         # Local Vite
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
-    allow_credentials=False,   # MUST be False (no cookies/auth)
+    allow_origins=["*"],  # you can replace "*" with your frontend URL
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -------------------------------
-# DIRECTORIES
-# -------------------------------
-UPLOAD_DIR = "uploads"
-FRAMES_DIR = "frames"
+# Load faster-whisper model ONCE
+fw_model = WhisperModel(
+    "base",
+    device="cpu",
+    compute_type="float32"
+)
 
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(FRAMES_DIR, exist_ok=True)
+UPLOAD_FOLDER = "uploads"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# -------------------------------
-# STATIC FILES
-# -------------------------------
-app.mount("/static", StaticFiles(directory="."), name="static")
+# -------------------- UTILITIES --------------------
 
-# -------------------------------
-# ROUTES
-# -------------------------------
-@app.get("/")
-def read_root():
-    return {"message": "Rhetoric Backend API is running"}
+def extract_audio(video_path: str) -> str:
+    """Extract mono 16kHz WAV audio from video using ffmpeg."""
+    audio_path = os.path.splitext(video_path)[0] + ".wav"
 
-@app.post("/analyze")
-async def analyze_video(file: UploadFile = File(...)):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No file uploaded")
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i", video_path,
+        "-vn",
+        "-ac", "1",
+        "-ar", "16000",
+        "-acodec", "pcm_s16le",
+        audio_path
+    ]
 
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
+    subprocess.run(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=True
+    )
 
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    return audio_path
 
-    # 1. Gesture Analysis
-    flagged_frames = analyze_video_gestures(file_path, FRAMES_DIR)
+def analyze_audio(audio_path: str):
+    """Analyze speech duration and silence ratio."""
+    y, sr = librosa.load(audio_path, sr=16000)
+    intervals = librosa.effects.split(y, top_db=30)
+    total_speech_duration = sum((end - start) / sr for start, end in intervals)
+    total_duration = len(y) / sr
+    silence_ratio = (
+        (total_duration - total_speech_duration) / total_duration
+        if total_duration > 0 else 0
+    )
+    return total_speech_duration, silence_ratio
 
-    # 2. Audio Analysis
-    audio_analysis = analyze_audio_quality(file_path)
+def transcribe_audio(audio_path: str):
+    """Transcribe audio and return segments + transcript."""
+    segments, _ = fw_model.transcribe(audio_path)
+    segments = list(segments)
+    transcript = " ".join(segment.text for segment in segments)
+    return segments, transcript
 
-    # 3. Motivational Quote
-    quote = get_motivational_quote()
+def compute_feedback(transcript: str, speech_duration: float, silence_ratio: float, segments):
+    """Generate public speaking feedback."""
+    words = transcript.split()
+    pace_wpm = len(words) / (speech_duration / 60) if speech_duration > 0 else 0
 
-    # 4. Suggested Video
-    suggestion_video = "https://www.youtube.com/watch?v=i0a61wFaF8A"
+    filler_words = sum(transcript.lower().count(w) for w in ["um", "uh", "like"])
+
+    unclear_segments = [s.text.strip() for s in segments if s.avg_logprob < -0.7]
 
     return {
-        "filename": file.filename,
-        "flagged_frames": flagged_frames,
-        "audio_analysis": audio_analysis,
-        "quote": quote,
-        "suggestion_video": suggestion_video,
+        "pace_wpm": round(pace_wpm, 2),
+        "silence_ratio": round(silence_ratio, 2),
+        "filler_word_count": filler_words,
+        "unclear_segments": unclear_segments,
+        "transcript": transcript
     }
 
-# -------------------------------
-# SERVER ENTRY POINT
-# -------------------------------
-if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True
-    )
+# -------------------- ROUTES --------------------
+
+@app.get("/")
+async def root():
+    return {"message": "Public Speaking Analyzer Backend Running!"}
+
+@app.post("/upload_video/")
+async def upload_video(file: UploadFile = File(...)):
+    try:
+        # Save uploaded video as webm
+        input_path = os.path.join(UPLOAD_FOLDER, "upload.webm")
+        with open(input_path, "wb") as f:
+            f.write(await file.read())
+
+        # Convert WebM -> MP4
+        mp4_path = os.path.join(UPLOAD_FOLDER, "upload.mp4")
+        subprocess.run([
+            "ffmpeg", "-y", "-i", input_path, "-c:v", "copy", "-c:a", "aac", mp4_path
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+        # Now process MP4 normally
+        audio_path = extract_audio(mp4_path)
+        speech_duration, silence_ratio = analyze_audio(audio_path)
+        segments, transcript = transcribe_audio(audio_path)
+        feedback = compute_feedback(transcript, speech_duration, silence_ratio, segments)
+
+        # Cleanup
+        os.remove(input_path)
+        os.remove(mp4_path)
+        os.remove(audio_path)
+
+        return JSONResponse(content=feedback)
+
+    except subprocess.CalledProcessError:
+        return JSONResponse(content={"error": "ffmpeg conversion failed."}, status_code=500)
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
