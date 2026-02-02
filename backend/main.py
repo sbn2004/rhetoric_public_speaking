@@ -12,18 +12,19 @@ from analyzer import (
 
 app = FastAPI()
 
-# -------------------------------
-# CORS CONFIGURATION (PERMANENT)
-# -------------------------------
+# ---------------------------------
+# CORS CONFIGURATION (VERCEL + LOCAL)
+# ---------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5173",
+        "https://rhetoric-public-speaking.vercel.app",  # Vercel frontend
+        "http://localhost:5173",                         # Local Vite
         "http://127.0.0.1:5173",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
     ],
-    allow_credentials=False,   # IMPORTANT: keeps browser stable
+    allow_credentials=False,   # MUST be False (no cookies/auth)
     allow_methods=["*"],
     allow_headers=["*"],
 )
